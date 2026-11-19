@@ -17,6 +17,7 @@ dependencies = [
     "langchain-tavily>=0.2.18",
     "langchain-text-splitters>=1.1.3",
     "langchainhub>=0.1.21",
+    "langfuse>=5.2.0",
     "langsmith>=0.15.0",
     "nltk>=3.10.4",
     "openai>=3.55.0",
