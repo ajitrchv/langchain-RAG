@@ -74,7 +74,7 @@ async def main():
     )
     res = tCrawl.invoke({
         "url":"https://python.langchain.com/",
-        "max_depth":1,
+        "max_depth":10,
         "extract_depth":"advanced",
         # "instructions": "content on ai agents"
     })
@@ -87,7 +87,7 @@ async def main():
             ]
     log_success(f"TavilyCrawl: Successfully crawled {len(alldocs)} URLs from doc site!")
     text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000,
+    chunk_size=4000,
     chunk_overlap=200,
     separators=["\n\n", "\n", " ", ""]
     )
