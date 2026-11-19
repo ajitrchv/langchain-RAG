@@ -38,6 +38,33 @@ tavily_extract=TavilyExtract()
 tavily_map=TavilyMap(max_depth=5, max_breadth=20, max_pages=1000)
 tCrawl=TavilyCrawl()
 
+def initPineCone(vStoreIndexName):
+    pc = Pinecone(
+        api_key=os.environ["PINECONE_API_KEY"]
+        )
+
+    index_name = vStoreIndexName
+
+    if not pc.has_index(index_name):
+        print(f"Creating Pinecone index: {index_name}")
+
+        pc.create_index(
+            name=index_name,
+            dimension=1536,
+            metric="cosine",
+            spec=ServerlessSpec(
+                cloud="aws",
+                region="us-east-1"
+            )
+        )
+    else:
+        print("Index already exists. Skipping creation.")
+
+    vStore = PineconeVectorStore(
+        index_name=index_name,
+        embedding=embeddings
+    )
+    return vStore
 
 async def main():
     """Main async function to orchestrate the entire process"""
@@ -70,31 +97,7 @@ async def main():
     log_success(f"Created {len(chunks)} chunks from {len(alldocs)} documents")
 
 
-    pc = Pinecone(
-        api_key=os.environ["PINECONE_API_KEY"]
-        )
-
-    index_name = "langchain-doc-index"
-
-    if not pc.has_index(index_name):
-        print(f"Creating Pinecone index: {index_name}")
-
-        pc.create_index(
-            name=index_name,
-            dimension=1536,
-            metric="cosine",
-            spec=ServerlessSpec(
-                cloud="aws",
-                region="us-east-1"
-            )
-        )
-    else:
-        print("Index already exists. Skipping creation.")
-
-    vStore = PineconeVectorStore(
-        index_name=index_name,
-        embedding=embeddings
-)
+    vStore = initPineCone("langchain-doc-index")
     vStore.add_documents(chunks)
 
     log_success(f"Successfully indexed {len(chunks)} chunks into Pinecone!")
