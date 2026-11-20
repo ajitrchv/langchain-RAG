@@ -7,7 +7,23 @@ from typing import Any, Dict, List
 import streamlit as st
 
 from backend import run_llm
-from ingestion import delete_pdfs, ingest_pdf
+from ingestion import (
+    _URL_PATTERN,
+    MAX_URLS_PER_MESSAGE,
+    delete_pdfs,
+    find_urls,
+    ingest_pdf,
+    ingest_url,
+)
+from settings import (
+    PROVIDERS,
+    build_llm_config,
+    key_source,
+    list_ollama_models,
+    load_settings,
+    save_settings,
+    validate_base_url,
+)
 
 DEFAULT_TITLE = "Untitled chat"
 HISTORY_FILE = Path(__file__).resolve().parent / "chat_history.json"
@@ -76,20 +92,118 @@ def _format_sources(context_docs: List[Any]) -> List[str]:
     ]
 
 
+def _openai_key() -> str | None:
+    """OpenAI key entered in Settings (embeddings always use OpenAI); None falls back to the environment."""
+    return st.session_state.api_keys.get("openai") or None
+
+
 def _drop_pdfs(session_id: str) -> None:
     """Delete the PDF vectors of a session from Pinecone and forget them locally."""
     session = st.session_state.sessions.get(session_id)
     if not session or not session.get("pdfs"):
         return
     try:
-        delete_pdfs(session_id)
+        delete_pdfs(session_id, openai_api_key=_openai_key())
     except Exception:
         st.warning("Could not remove the uploaded PDF(s) from the index.")
     session["pdfs"] = []
 
 
-st.set_page_config(page_title="LangChain Documentation Helper -- This is going to be chainging as I add statement parser", layout="centered")
-st.title("LangChain Documentation Helper")
+@st.dialog("Settings")
+def _settings_dialog() -> None:
+    settings = st.session_state.settings
+    keys = st.session_state.api_keys
+
+    provider_ids = list(PROVIDERS)
+    provider = st.selectbox(
+        "LLM provider",
+        provider_ids,
+        index=provider_ids.index(settings["provider"]),
+        format_func=lambda provider_id: PROVIDERS[provider_id],
+    )
+
+    new_url = settings["ollama_base_url"]
+    if provider == "ollama":
+        new_url = st.text_input("Ollama server URL", value=settings["ollama_base_url"]) or ""
+        try:
+            installed = list_ollama_models(validate_base_url(new_url))
+        except ValueError:
+            installed = []
+        if installed:
+            current = settings["models"]["ollama"]
+            model = st.selectbox(
+                "Model",
+                installed,
+                index=installed.index(current) if current in installed else 0,
+            )
+        else:
+            st.caption("No models found on that server. Run `ollama serve` and `ollama pull <model>`.")
+            model = st.text_input("Model", value=settings["models"]["ollama"])
+    else:
+        model = st.text_input("Model", value=settings["models"][provider])
+        source = key_source(provider, keys)
+        st.text_input(
+            f"{PROVIDERS[provider]} API key",
+            type="password",
+            key=f"key_input_{provider}",
+            placeholder="Leave empty to keep the current key",
+            help="Kept in memory for this browser session only; never written to disk.",
+        )
+        st.caption(
+            {
+                "session": "Using the key you entered in this session.",
+                "environment": "Using the key from the server environment.",
+                "none": "No key configured.",
+            }[source]
+        )
+
+    if provider != "openai":
+        key_hint = "" if key_source("openai", keys) != "none" else " (none configured yet)"
+        st.caption(
+            f"Document embeddings for retrieval always use OpenAI, so an OpenAI key is still required{key_hint}."
+        )
+        if key_source("openai", keys) == "none":
+            st.text_input(
+                "OpenAI API key (for embeddings)",
+                type="password",
+                key="key_input_openai",
+                placeholder="Leave empty to keep the current key",
+            )
+    elif provider == "openai":
+        st.caption("This key is also used for document embeddings.")
+
+    if st.button("Save", type="primary", use_container_width=True):
+        model = (model or "").strip()
+        if not model:
+            st.error("Enter a model name.")
+            return
+        if provider == "ollama":
+            try:
+                new_url = validate_base_url(new_url)
+            except ValueError as e:
+                st.error(str(e))
+                return
+            settings["ollama_base_url"] = new_url
+        for key_provider in ("openai", "anthropic"):
+            entered = (st.session_state.get(f"key_input_{key_provider}") or "").strip()
+            if entered:
+                keys[key_provider] = entered
+        settings["provider"] = provider
+        settings["models"][provider] = model
+        try:
+            save_settings(settings)
+        except OSError:
+            st.warning("Settings applied, but could not be saved for the next restart.")
+        st.rerun()
+
+
+st.set_page_config(page_title="🌞SummeRice🍚", layout="centered")
+st.title("🌞SummeRice🍚")
+
+if "settings" not in st.session_state:
+    st.session_state.settings = load_settings()
+if "api_keys" not in st.session_state:
+    st.session_state.api_keys = {}
 
 if "sessions" not in st.session_state:
     _history = _load_history()
@@ -102,7 +216,7 @@ _save_history()
 
 # Read the prompt before the sidebar renders so a new chat's title shows up immediately.
 chat_value = st.chat_input(
-    "Ask a question, or attach a PDF to chat with it…",
+    "Ask a question, attach a PDF, or paste a link to chat with it…",
     accept_file="multiple",
     file_type=["pdf"],
 )
@@ -124,6 +238,14 @@ with st.sidebar:
         """,
         unsafe_allow_html=True,
     )
+    if st.button("⚙️ Settings", use_container_width=True):
+        _settings_dialog()
+    _active_cfg = st.session_state.settings
+    st.caption(
+        f"Model: {PROVIDERS[_active_cfg['provider']]} · {_active_cfg['models'][_active_cfg['provider']]}"
+    )
+    st.divider()
+    st.markdown("## 🌞🍚")
     st.subheader("Chat sessions")
     if st.button("➕ New chat", use_container_width=True):
         _new_session()
@@ -169,7 +291,10 @@ if uploaded_files:
             try:
                 with st.spinner(f"Indexing {uploaded.name}…"):
                     chunk_count = ingest_pdf(
-                        uploaded.getvalue(), uploaded.name, st.session_state.current_session
+                        uploaded.getvalue(),
+                        uploaded.name,
+                        st.session_state.current_session,
+                        openai_api_key=_openai_key(),
                     )
                 if uploaded.name not in current_session.setdefault("pdfs", []):
                     current_session["pdfs"].append(uploaded.name)
@@ -189,6 +314,35 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
+    urls = find_urls(prompt)[:MAX_URLS_PER_MESSAGE]
+    if urls:
+        with st.chat_message("assistant"):
+            for url in urls:
+                if url in current_session.setdefault("pdfs", []):
+                    continue
+                try:
+                    with st.spinner(f"Reading {url}…"):
+                        chunk_count = ingest_url(
+                            url, st.session_state.current_session, openai_api_key=_openai_key()
+                        )
+                    current_session["pdfs"].append(url)
+                    note = (
+                        f"Indexed **{url}** ({chunk_count} chunks). "
+                        "Answers in this chat are now based only on the added file(s)/page(s)."
+                    )
+                except ValueError as e:
+                    note = f"Could not index **{url}**: {e}"
+                except Exception:
+                    note = f"Could not index **{url}** due to an unexpected error."
+                st.markdown(note)
+                messages.append({"role": "assistant", "content": note, "sources": []})
+
+    # A message that is only link(s) just adds the page(s); there is no question to answer yet.
+    # If every link failed and nothing else is indexed, don't silently answer from the LangChain docs.
+    if urls and (not _URL_PATTERN.sub("", prompt).strip() or not current_session.get("pdfs")):
+        prompt = None
+
+if prompt:
     with st.chat_message("assistant"):
         try:
             with st.spinner("Retrieving docs and generating answer…"):
@@ -196,6 +350,10 @@ if prompt:
                     prompt,
                     session_id=st.session_state.current_session,
                     use_pdf=bool(current_session.get("pdfs")),
+                    llm_config=build_llm_config(
+                        st.session_state.settings, st.session_state.api_keys
+                    ),
+                    openai_api_key=_openai_key(),
                 )
                 answer = str(result.get("answer", "")).strip() or "(No answer returned.)"
                 sources = _format_sources(result.get("context", []))

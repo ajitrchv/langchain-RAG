@@ -2,6 +2,7 @@ import asyncio
 import io
 from importlib import metadata
 import os
+import re
 import ssl
 from typing import Any, Dict, List
 from unittest import result
@@ -29,19 +30,29 @@ os.environ["SSL_CERT_FILE"] =certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"]=certifi.where()
 
 
-embeddings = OpenAIEmbeddings(
-    model="text-embedding-3-small", show_progress_bar=True, chunk_size=50, retry_min_seconds=10
-)
+def get_embeddings(openai_api_key: str | None = None) -> OpenAIEmbeddings:
+    """Embedding model for the index. Uses the given key, else OPENAI_API_KEY from the environment."""
+    kwargs: Dict[str, Any] = {"api_key": openai_api_key} if openai_api_key else {}
+    return OpenAIEmbeddings(
+        model="text-embedding-3-small",
+        show_progress_bar=True,
+        chunk_size=50,
+        retry_min_seconds=10,
+        timeout=60,
+        **kwargs,
+    )
 
 
 #chroma=Chroma
 # vStore = PineconeVectorStore(index_name="langchain-doc-index", embedding=embeddings)
-tavily_extract=TavilyExtract()
+tExtract=TavilyExtract()
 tavily_map=TavilyMap(max_depth=5, max_breadth=20, max_pages=1000)
 tCrawl=TavilyCrawl()
 
 INDEX_NAME = "langchain-doc-index"
 MAX_PDF_BYTES = 20 * 1024 * 1024
+MAX_URLS_PER_MESSAGE = 3
+_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+")
 
 
 def pdf_namespace(session_id: str) -> str:
@@ -49,7 +60,7 @@ def pdf_namespace(session_id: str) -> str:
     return f"pdf-{session_id}"
 
 
-def initPineCone(vStoreIndexName, namespace=None):
+def initPineCone(vStoreIndexName, namespace=None, openai_api_key=None):
     pc = Pinecone(
         api_key=os.environ["PINECONE_API_KEY"]
         )
@@ -73,13 +84,13 @@ def initPineCone(vStoreIndexName, namespace=None):
 
     vStore = PineconeVectorStore(
         index_name=index_name,
-        embedding=embeddings,
+        embedding=get_embeddings(openai_api_key),
         namespace=namespace,
     )
     return vStore
 
 
-def ingest_pdf(file_bytes: bytes, filename: str, session_id: str) -> int:
+def ingest_pdf(file_bytes: bytes, filename: str, session_id: str, openai_api_key=None) -> int:
     """Extract, chunk and index a PDF into the session's own Pinecone namespace.
 
     Returns the number of chunks indexed. Raises ValueError for invalid PDFs.
@@ -104,13 +115,60 @@ def ingest_pdf(file_bytes: bytes, filename: str, session_id: str) -> int:
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
     chunks = splitter.split_documents(pages)
-    initPineCone(INDEX_NAME, namespace=pdf_namespace(session_id)).add_documents(chunks)
+    initPineCone(
+        INDEX_NAME, namespace=pdf_namespace(session_id), openai_api_key=openai_api_key
+    ).add_documents(chunks)
     return len(chunks)
 
 
-def delete_pdfs(session_id: str) -> None:
-    """Remove all PDF vectors indexed for a chat session."""
-    initPineCone(INDEX_NAME, namespace=pdf_namespace(session_id)).delete(delete_all=True)
+def find_urls(text: str) -> List[str]:
+    """Return the distinct http(s) URLs in a chat message, in order of appearance."""
+    urls = []
+    for match in _URL_PATTERN.findall(text or ""):
+        url = match.rstrip(".,;:!?")
+        # Drop a trailing bracket only when it is unbalanced, so Wiki_(topic) URLs survive.
+        while url and url[-1] in ")]}" and url.count(url[-1]) > url.count({")": "(", "]": "[", "}": "{"}[url[-1]]):
+            url = url[:-1]
+        urls.append(url)
+    return list(dict.fromkeys(urls))
+
+
+def ingest_url(url: str, session_id: str, openai_api_key=None) -> int:
+    """Fetch a web page, chunk it and index it into the session's Pinecone namespace.
+
+    Returns the number of chunks indexed. Raises ValueError for unusable URLs/pages.
+    """
+    if not url.startswith("https://"):
+        raise ValueError("Only https:// URLs are supported.")
+
+    try:
+        result = tExtract.invoke({"urls": [url]})
+    except Exception as e:
+        raise ValueError("The page could not be fetched.") from e
+
+    pages = [
+        r for r in (result.get("results") or []) if (r.get("raw_content") or "").strip()
+    ] if isinstance(result, dict) else []
+    if not pages:
+        raise ValueError("No readable content was found at that URL.")
+
+    docs = [
+        Document(page_content=r["raw_content"], metadata={"source": r.get("url") or url})
+        for r in pages
+    ]
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
+    chunks = splitter.split_documents(docs)
+    initPineCone(
+        INDEX_NAME, namespace=pdf_namespace(session_id), openai_api_key=openai_api_key
+    ).add_documents(chunks)
+    return len(chunks)
+
+
+def delete_pdfs(session_id: str, openai_api_key=None) -> None:
+    """Remove all PDF/web page vectors indexed for a chat session."""
+    initPineCone(
+        INDEX_NAME, namespace=pdf_namespace(session_id), openai_api_key=openai_api_key
+    ).delete(delete_all=True)
 
 async def main():
     """Main async function to orchestrate the entire process"""

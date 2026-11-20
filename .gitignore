@@ -165,3 +165,5 @@ langchain-docs/
 # Local chat history (contains conversation data)
 chat_history.json
 chat_history.tmp
+settings.json
+settings.tmp
