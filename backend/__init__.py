@@ -34,23 +34,6 @@ def build_model(llm_config: Optional[Dict[str, Any]] = None):
     return init_chat_model(config["model"], model_provider=provider, **kwargs)
 
 
-def make_docs_retriever_tool(openai_api_key: Optional[str] = None):
-    """Build the retrieval tool over the LangChain documentation index."""
-    docs_store = initPineCone(INDEX_NAME, openai_api_key=openai_api_key)
-
-    @tool(response_format="content_and_artifact")
-    def retrieve_context(query):
-        """Retrieve relevant documentation to help answer the queries about langchain"""
-        retrieved_docs = docs_store.as_retriever().invoke(query, k=4)
-        serialized = "\n\n".join(
-            (f"source: {doc.metadata.get('source', 'unknown')}\n\nContent: {doc.page_content}")
-            for doc in retrieved_docs
-        )
-        return serialized, retrieved_docs
-
-    return retrieve_context
-
-
 def make_pdf_retriever_tool(session_id: str, openai_api_key: Optional[str] = None):
     """Build a retrieval tool restricted to the PDFs uploaded in one chat session."""
     pdf_store = initPineCone(
@@ -80,11 +63,11 @@ def run_llm(
     openai_api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Run the RAG pipeline to answer a query using retrieved documentaion.
+    Answer a query: from the added PDF(s)/web page(s) when use_pdf is set, otherwise directly from the LLM.
     Args:
         query: The users question
         session_id: Chat session id, used to locate uploaded PDFs
-        use_pdf: When True, answer only from the PDF(s) uploaded in this session
+        use_pdf: When True, answer only from the PDF(s)/web page(s) added in this session
         llm_config: Chat model settings (provider, model, api_key/base_url); defaults to OpenAI
         openai_api_key: Key used for embeddings when retrieving; defaults to OPENAI_API_KEY
 
@@ -93,25 +76,19 @@ def run_llm(
             - answer: The generated answer
             - context: List of retrieved documents
     """
-    if use_pdf and session_id:
-        system_prompt = (
-            "You are a helpful AI assistant that answers questions about PDF file(s) and web page(s) the user added. "
-            "You have access to a tool that retrieves passages from them. "
-            "Always call the tool before answering. "
-            "Answer ONLY from the retrieved passages and never use outside knowledge. "
-            "Cite the source file or URL (and page number for PDFs) you used. "
-            "If the answer is not in the retrieved passages, say that the added material does not contain it."
-        )
-        tools = [make_pdf_retriever_tool(session_id, openai_api_key)]
-    else:
-        system_prompt=(
-            "You are a helpful AI assistant that answers questions about langchain documentaion"
-            "You have access to a tool that retrieves relevant docs"
-            "Use the tool to find relevant info before answering questions"
-            "Always cite the sources you use in your answers"
-            "If you cannot find the user in the retrieved document, say so."
-        )
-        tools = [make_docs_retriever_tool(openai_api_key)]
+    if not (use_pdf and session_id):
+        reply = build_model(llm_config).invoke([{"role": "user", "content": query}])
+        return {"answer": reply.content, "context": []}
+
+    system_prompt = (
+        "You are a helpful AI assistant that answers questions about PDF file(s) and web page(s) the user added. "
+        "You have access to a tool that retrieves passages from them. "
+        "Always call the tool before answering. "
+        "Answer ONLY from the retrieved passages and never use outside knowledge. "
+        "Cite the source file or URL (and page number for PDFs) you used. "
+        "If the answer is not in the retrieved passages, say that the added material does not contain it."
+    )
+    tools = [make_pdf_retriever_tool(session_id, openai_api_key)]
     agent = create_agent(build_model(llm_config), tools=tools, system_prompt=system_prompt)
 
     messages: list[AnyMessage | dict[str, Any]] = [{"role":"user", "content":query}]

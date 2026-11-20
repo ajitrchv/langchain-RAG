@@ -30,7 +30,7 @@ HISTORY_FILE = Path(__file__).resolve().parent / "chat_history.json"
 
 WELCOME_MESSAGE = {
     "role": "assistant",
-    "content": "Ask me anything about LangChain docs. I’ll retrieve relevant context and cite sources.",
+    "content": "Ask me anything. Add PDFs or paste links and I’ll answer from them and cite sources.",
     "sources": [],
 }
 
@@ -238,13 +238,6 @@ with st.sidebar:
         """,
         unsafe_allow_html=True,
     )
-    if st.button("⚙️ Settings", use_container_width=True):
-        _settings_dialog()
-    _active_cfg = st.session_state.settings
-    st.caption(
-        f"Model: {PROVIDERS[_active_cfg['provider']]} · {_active_cfg['models'][_active_cfg['provider']]}"
-    )
-    st.divider()
     st.markdown("## 🌞🍚")
     st.subheader("Chat sessions")
     if st.button("➕ New chat", use_container_width=True):
@@ -273,6 +266,14 @@ with st.sidebar:
         del st.session_state.sessions[st.session_state.current_session]
         st.session_state.pop("current_session", None)
         st.rerun()
+    st.divider()
+    if st.button("⚙️ Settings", use_container_width=True):
+        _settings_dialog()
+    _active_cfg = st.session_state.settings
+    st.caption(
+        f"Model: {PROVIDERS[_active_cfg['provider']]} · {_active_cfg['models'][_active_cfg['provider']]}"
+    )
+
 
 current_session = st.session_state.sessions[st.session_state.current_session]
 messages: List[Dict[str, Any]] = current_session["messages"]
@@ -338,14 +339,14 @@ if prompt:
                 messages.append({"role": "assistant", "content": note, "sources": []})
 
     # A message that is only link(s) just adds the page(s); there is no question to answer yet.
-    # If every link failed and nothing else is indexed, don't silently answer from the LangChain docs.
+    # If every link failed and nothing else is indexed, don't silently answer without the linked page.
     if urls and (not _URL_PATTERN.sub("", prompt).strip() or not current_session.get("pdfs")):
         prompt = None
 
 if prompt:
     with st.chat_message("assistant"):
         try:
-            with st.spinner("Retrieving docs and generating answer…"):
+            with st.spinner("Generating answer…"):
                 result: Dict[str, Any] = run_llm(
                     prompt,
                     session_id=st.session_state.current_session,
