@@ -1,4 +1,5 @@
 import asyncio
+import io
 from importlib import metadata
 import os
 import ssl
@@ -16,6 +17,7 @@ from langchain_tavily import TavilyCrawl, TavilyExtract, tavily_crawl, tavily_ex
 from langfuse.langchain import CallbackHandler
 from numpy import where
 from pinecone import Pinecone, ServerlessSpec
+from pypdf import PdfReader
 from openai.types import vector_store
 from logger import(Colors, log_error, log_header, log_info, log_success, log_warning)
 
@@ -38,7 +40,16 @@ tavily_extract=TavilyExtract()
 tavily_map=TavilyMap(max_depth=5, max_breadth=20, max_pages=1000)
 tCrawl=TavilyCrawl()
 
-def initPineCone(vStoreIndexName):
+INDEX_NAME = "langchain-doc-index"
+MAX_PDF_BYTES = 20 * 1024 * 1024
+
+
+def pdf_namespace(session_id: str) -> str:
+    """Pinecone namespace holding the PDFs uploaded in a chat session."""
+    return f"pdf-{session_id}"
+
+
+def initPineCone(vStoreIndexName, namespace=None):
     pc = Pinecone(
         api_key=os.environ["PINECONE_API_KEY"]
         )
@@ -62,9 +73,44 @@ def initPineCone(vStoreIndexName):
 
     vStore = PineconeVectorStore(
         index_name=index_name,
-        embedding=embeddings
+        embedding=embeddings,
+        namespace=namespace,
     )
     return vStore
+
+
+def ingest_pdf(file_bytes: bytes, filename: str, session_id: str) -> int:
+    """Extract, chunk and index a PDF into the session's own Pinecone namespace.
+
+    Returns the number of chunks indexed. Raises ValueError for invalid PDFs.
+    """
+    if len(file_bytes) > MAX_PDF_BYTES:
+        raise ValueError("PDF is too large (max 20 MB).")
+    if not file_bytes.startswith(b"%PDF"):
+        raise ValueError("File is not a valid PDF.")
+
+    reader = PdfReader(io.BytesIO(file_bytes))
+    if reader.is_encrypted:
+        raise ValueError("Encrypted PDFs are not supported.")
+
+    source = os.path.basename(filename)
+    pages = [
+        Document(page_content=text, metadata={"source": source, "page": number})
+        for number, page in enumerate(reader.pages, start=1)
+        if (text := (page.extract_text() or "").strip())
+    ]
+    if not pages:
+        raise ValueError("No extractable text found in the PDF.")
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
+    chunks = splitter.split_documents(pages)
+    initPineCone(INDEX_NAME, namespace=pdf_namespace(session_id)).add_documents(chunks)
+    return len(chunks)
+
+
+def delete_pdfs(session_id: str) -> None:
+    """Remove all PDF vectors indexed for a chat session."""
+    initPineCone(INDEX_NAME, namespace=pdf_namespace(session_id)).delete(delete_all=True)
 
 async def main():
     """Main async function to orchestrate the entire process"""
